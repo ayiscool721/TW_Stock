@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-台股多功能強勢股選股面板 - 終極飆速版 (多線程運算 + 大批次下載 + 全面快取)
+台股多功能強勢股選股面板 - 終極飆速雲端防禦版
 ===================================================================
+優化重點：自動偵測海外 IP 封鎖，無縫切換 twstock 內建離線資料庫
 執行指令：streamlit run stock_app.py
 """
 
@@ -18,10 +19,9 @@ from concurrent.futures import ThreadPoolExecutor
 # 設定網頁配置
 st.set_page_config(page_title="台股飆速雙模組選股器", layout="wide")
 
-st.title("⚡ 台股強勢股自訂選股後台 (終極飆速版)")
+st.title("⚡ 台股強勢股自訂選股後台 (雲端防禦飆速版)")
 st.markdown("""
-本版本已啟動 **【平行運算】** 與 **【數據快取技術】**。
-每日盤後第一次下載需約 15-25 秒，**下載完成後，隨意微調左側參數，皆可在 0.5 秒內瞬間完工！**
+本版本已啟動 **【平行運算】**、**【數據快取】** 與 **【海外 IP 智慧無縫切換機制】**。
 ---
 """)
 
@@ -38,7 +38,6 @@ strategy_mode = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 
-# 根據選擇的策略，動態顯示不同的參數區塊
 if strategy_mode == "🔄 回檔支撐模式":
     st.sidebar.subheader("📉 回檔專屬設定")
     ma_choice = st.sidebar.selectbox("選擇回檔判定均線", options=["5日均線 (5MA)", "10日均線 (10MA)", "20日均線 (20MA)"], index=2)
@@ -71,14 +70,16 @@ SCAN_DAYS = 3
 BREAKOUT_LOOKBACK = 15
 
 # ============================================================
-# 2. 核心加速機制：股票清單與大批次下載快取
+# 2. 核心加速與雲端防禦：股票清單與大批次下載快取
 # ============================================================
 @st.cache_data(ttl=3600)
-def get_all_taiwan_stocks():
+def get_all_taiwan_stocks_safe():
     tickers, name_map = [], {}
-    # 上市
+    is_fallback = False
+    
+    # 1. 優先嘗試官方 OpenAPI (本地執行時有效)
     try:
-        resp = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", timeout=5)
+        resp = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", timeout=3)
         if resp.status_code == 200:
             for item in resp.json():
                 code = item.get("CompanyCode", item.get("公司代號", ""))
@@ -88,9 +89,9 @@ def get_all_taiwan_stocks():
                     tickers.append(t)
                     name_map[t] = f"{name} (上市)"
     except Exception: pass
-    # 上櫃
+    
     try:
-        resp = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", timeout=5)
+        resp = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", timeout=3)
         if resp.status_code == 200:
             for item in resp.json():
                 code = item.get("SecuritiesCompanyCode", "")
@@ -100,14 +101,31 @@ def get_all_taiwan_stocks():
                     tickers.append(t)
                     name_map[t] = f"{name} (上櫃)"
     except Exception: pass
-    return list(dict.fromkeys(tickers)), name_map
+    
+    # 2. 🌟 雲端救星：如果前面因為海外 IP 封鎖導致完全抓不到股票，無縫啟動離線備用方案！
+    if not tickers:
+        is_fallback = True
+        try:
+            import twstock
+            for code, info in twstock.codes.items():
+                if len(code) == 4 and code.isdigit():
+                    if info.market == "上市" and info.type == "股票":
+                        t = f"{code}.TW"
+                        tickers.append(t)
+                        name_map[t] = f"{info.name} (上市)"
+                    elif info.market == "上櫃" and info.type == "股票":
+                        t = f"{code}.TWO"
+                        tickers.append(t)
+                        name_map[t] = f"{info.name} (上櫃)"
+        except Exception: pass
+        
+    return list(dict.fromkeys(tickers)), name_map, is_fallback
 
 
-# ⚡ 核心高速下載器：利用 Streamlit Cache 鎖定盤後歷史數據，大批次 400 節省握手時間
-@st.cache_data(ttl=14400) # 快取 4 小時 (盤後執行一次就免再等)
+@st.cache_data(ttl=14400) 
 def download_all_data_fast(tickers: list, start_str: str, end_str: str) -> dict:
     all_data = {}
-    BATCH_SIZE = 400  # 放大吞吐量
+    BATCH_SIZE = 400  
     batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
     
     for batch in batches:
@@ -137,7 +155,6 @@ def analyze_single_stock(ticker: str, df: pd.DataFrame, params: dict) -> dict | 
         df = df.sort_index()
         if len(df) < 40: return None
 
-        # 計算指標
         df["MA5"]  = df["Close"].rolling(5).mean()
         df["MA10"] = df["Close"].rolling(10).mean()
         df["MA20"] = df["Close"].rolling(20).mean()
@@ -152,7 +169,6 @@ def analyze_single_stock(ticker: str, df: pd.DataFrame, params: dict) -> dict | 
 
         mode = params["mode"]
         
-        # 📦 箱型模式
         if mode == "📦 箱型糾結突破模式":
             if (df["Volume"].iloc[-1] / 1000) < params["min_vol_lots"]: return None
             
@@ -183,8 +199,6 @@ def analyze_single_stock(ticker: str, df: pd.DataFrame, params: dict) -> dict | 
                             "當前收盤價": round(df["Close"].iloc[-1], 2), "今日成交量(張)": int(df["Volume"].iloc[-1] / 1000),
                             "突破量能放大(倍)": round(v_ratio, 2), "備註說明": f"{note} (盤整{params['box_days']}天,震幅{round(box_height,1)}%,糾結{round(ma_tangle,1)}%)"
                         }
-
-        # 🔄 回檔 / ⚡ 純突破 模式
         else:
             if (df["Vol_MA5"].iloc[-1] / 1000) < params["min_vol_lots"]: return None
             
@@ -209,7 +223,7 @@ def analyze_single_stock(ticker: str, df: pd.DataFrame, params: dict) -> dict | 
                                         "當前收盤價": round(df["Close"].iloc[-1], 2), "今日成交量(張)": int(df["Volume"].iloc[-1] / 1000),
                                         "突破量能放大(倍)": round(v_ratio, 2), "備註說明": f"回測近{params['target_ma']}MA附近"
                                     }
-            else: # 純突破
+            else: 
                 for i in range(n_rows - SCAN_DAYS, n_rows):
                     row_b = df.iloc[i]
                     row_b_prev = df.iloc[i - 1]
@@ -229,11 +243,16 @@ def analyze_single_stock(ticker: str, df: pd.DataFrame, params: dict) -> dict | 
     except Exception: return None
 
 # ============================================================
-# 4. 驅動核心：多線程並行運算控制
+# 4. 驅動核心與 UI 回饋
 # ============================================================
-all_tickers, name_map = get_all_taiwan_stocks()
+all_tickers, name_map, is_fallback = get_all_taiwan_stocks_safe()
 
-# 打包使用者目前在介面輸入的參數
+# 提示目前伺服器抓取狀態
+if is_fallback:
+    st.sidebar.warning("🛡️ 提示：偵測到雲端海外 IP 阻擋，已自動切換為內建離線台股代碼庫！")
+else:
+    st.sidebar.success("🟢 提示：成功透過台灣官方 API 獲取即時股票代碼！")
+
 current_params = {
     "mode": strategy_mode,
     "target_ma": target_ma if 'target_ma' in locals() else 20,
@@ -250,29 +269,24 @@ current_params = {
 if st.sidebar.button("🚀 開始全自動高速掃描", use_container_width=True):
     t_start = time.time()
     
-    # 建立日期字串
     today = datetime.today()
     end_date_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     start_date_str = (today - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     
     status_box = st.empty()
-    status_box.info("📥 正在下載/讀取歷史K線數據 (若為今日首次下載需約 15 秒)...")
+    status_box.info(f"📥 正在從大盤抓取 {len(all_tickers)} 檔個股歷史數據 (首次需約 15~25 秒)...")
     
-    # 呼叫快取下載器
     cached_data_dict = download_all_data_fast(all_tickers, start_date_str, end_date_str)
     
     status_box.info("⚡ 數據載入成功！正在調動 CPU 所有線程並行計算指標...")
     
     results = []
     
-    # 🌟 核心高能量：使用 ThreadPoolExecutor 開啟多核心平行運算
     with ThreadPoolExecutor() as executor:
-        # 將待處理任務包裝成 job
         futures = {
             executor.submit(analyze_single_stock, ticker, df, current_params): ticker 
             for ticker, df in cached_data_dict.items()
         }
-        
         for future in futures:
             res = future.result()
             if res:
@@ -280,15 +294,13 @@ if st.sidebar.button("🚀 開始全自動高速掃描", use_container_width=Tru
                 results.append(res)
                 
     t_end = time.time()
-    status_box.success(f"✅ 掃描完成！本次計算共耗時：{round(t_end - t_start, 2)} 秒。")
+    status_box.success(f"✅ 掃描完成！本次真實計算共耗時：{round(t_end - t_start, 2)} 秒。")
     
-    # 展示結果
     st.subheader(f"🎯 篩選結果 (當前模式：{strategy_mode}，共找到 {len(results)} 檔)")
     if results:
         df_res = pd.DataFrame(results)
         cols = ["股票代碼", "股票名稱", "操作型態", "訊號觸發日", "當前收盤價", "今日成交量(張)", "突破量能放大(倍)", "備註說明"]
         df_res = df_res[cols]
-        
         st.dataframe(df_res, use_container_width=True, hide_index=True)
         
         csv = df_res.to_csv(index=False).encode('utf-8-sig')
@@ -299,6 +311,6 @@ if st.sidebar.button("🚀 開始全自動高速掃描", use_container_width=Tru
             mime="text/csv",
         )
     else:
-        st.warning("⚠️ 沒有符合當前參數的股票。因為速度變快了，你可以試著直接在左側微調參數，體驗秒級重新選股！")
+        st.warning("⚠️ 沒有符合當前參數的股票。建議將『箱型高低震幅限制』稍微拉大至 15%，或將『均線糾結度』放寬到 4% 試試看！")
 
         #streamlit run stock_app.py
